@@ -1,0 +1,21 @@
+# 运行时生成的数据目录（日志、状态、已上传清单等）
+data/
+
+# 真实配置文件（含密钥，不提交；仓库只保留 config.example.json）
+config.json
+config.*.json
+!config.example.json
+
+# 编译产物
+*.exe
+*.exe.bak
+*.pdb
+*.obj
+
+# 编辑器 / 系统
+.vs/
+.idea/
+*.user
+Thumbs.db
+desktop.ini
+.DS_Store

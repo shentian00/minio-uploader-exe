@@ -1,0 +1,322 @@
+﻿==================================================================
+  照片自动上传 MinIO 程序（minio-uploader.exe）操作手册
+==================================================================
+
+一、程序是做什么的
+------------------------------------------------------------------
+开机后自动在后台运行，把本机指定目录里的照片上传到 MinIO。
+
+  1. 每 10 秒扫描一次照片目录（含子目录），只处理 jpg / jpeg / bmp。
+  2. 照片最后修改超过 30 秒才上传，避免上传还没写完的照片。
+  3. 4 个线程同时上传，上传时 MinIO 会校验内容是否完整。
+     当天的照片：上传成功后本地先保留，过了 0 点，先到 MinIO 核对大小和 MD5，
+                 一致才删除本地；MinIO 上没有或不一致就重新上传后再删。
+     之前日期的照片：上传成功后立即删除本地。
+     （由 KeepLocalDays 控制，见第八节；设为 0 则所有照片上传成功后立即删除）
+     本地文件夹一律不删除。
+  4. 同一张照片上传失败 5 次，就不再上传，移到“失败目录”，
+     并记录到失败目录下的 failed-records.csv。
+  5. MinIO 连不上、断网、密钥错误时，程序自动暂停，恢复后自动继续，
+     这种情况不算照片失败次数。
+  6. 看门狗每 1 分钟检查一次，程序不在运行就自动重启，并记录重启日志。
+  7. 开机即运行，不需要登录 Windows，没有窗口。
+  8. 是一个独立的 exe，只依赖 Windows 自带的 .NET Framework 4.x
+     （Windows 10 / 11 都自带），不需要安装任何软件，也不依赖 PowerShell。
+
+目录对应关系（默认配置）：
+  本地   D:\photos\202610\20261021\a.jpg
+  MinIO  your-bucket 桶 / photos/202610/20261021/a.jpg
+  本地新出现的日期文件夹，MinIO 上会自动出现同名文件夹。
+
+
+二、文件说明
+------------------------------------------------------------------
+部署时只需要这 4 个文件：
+  minio-uploader.exe   程序（上传、看门狗、安装、卸载都是它）
+  config.json          配置文件（MinIO 地址、密钥、目录等）
+  minio-policy.json    MinIO 上传账号的权限策略（在 MinIO 控制台使用）
+  操作手册.txt          本文件
+  view-log.cmd         双击实时查看当天上传日志（可选）
+
+src 文件夹是源代码和编译脚本（build.cmd），部署时不需要。
+
+运行后自动生成：
+  data\logs\           日志目录
+  data\state.json      照片失败次数记录（程序自己用，不要手动改）
+  data\uploaded.idx    已上传、本地暂时保留的照片清单（程序自己用，不要手动改；
+                       误删也没关系，只会让当天的照片重新上传一次）
+  D:\photos_failed\                    失败照片
+  D:\photos_failed\failed-records.csv  失败记录（可用 Excel 打开）
+
+
+三、部署前准备（每个 MinIO 只需做一次）
+------------------------------------------------------------------
+1. 确认 MinIO 的 API 地址
+   MinIO 有两个端口：
+     9000  API 接口  ← 程序用这个
+     9001  网页控制台（浏览器登录用）
+   例如控制台是 http://your-minio-host:9001 ，程序就填 http://your-minio-host:9000
+
+2. 在 MinIO 控制台建一个上传专用账号（不要用管理员账号）
+   (1) 浏览器打开控制台，用管理员登录
+   (2) 左侧 Policies → Create Policy
+       名称：photo-uploader
+       内容：把 minio-policy.json 的全部内容粘贴进去 → Save
+   (3) 左侧 Identity → Users → Create User
+       User Name：photo-uploader            ← 这就是 AccessKey
+       Password：至少 8 位，不要和管理员密码相同 ← 这就是 SecretKey
+       下方勾选策略 photo-uploader → Save
+
+   注意：minio-policy.json 里写的是 your-bucket 桶、photos 目录。
+         如果 config.json 里的 Bucket 或 ObjectPrefix 改了，
+         策略里的 your-bucket、photos 也要改成一样的。
+
+
+四、安装步骤（每台电脑做一次）
+------------------------------------------------------------------
+第 1 步：拷贝程序
+   把 4 个文件拷到电脑上一个固定位置，例如：
+     D:\minio-uploader\
+   注意：
+   - 装好后不要再移动或改名这个文件夹（计划任务记录的是这个路径）。
+     如果一定要移动，移动后重新执行第 3 步。
+   - 从别的电脑拷过来时，不要带 data 文件夹（那是别的电脑的日志和记录）。
+   - 如果杀毒软件 / 电脑管家把 minio-uploader.exe 拦截或隔离，
+     请在软件里把 D:\minio-uploader 加入信任区。
+
+第 2 步：修改 config.json
+   用记事本打开 config.json，至少修改：
+     "Endpoint":  "http://MinIO地址:9000",
+     "AccessKey": "上传账号的用户名",
+     "SecretKey": "上传账号的密码",
+   再确认照片目录是否正确：
+     "SourceDir": "D:\\photos",
+     "FailedDir": "D:\\photos_failed",
+   注意：
+   - 路径里的反斜杠要写两个，例如 D:\\photos
+   - 英文双引号、行末的英文逗号不要删
+   - 其他参数一般不用改，含义见第八节
+
+第 3 步：用管理员身份安装
+   (1) 开始菜单搜索 cmd → 右键“命令提示符” → 以管理员身份运行
+   (2) 输入：
+         cd /d D:\minio-uploader
+         minio-uploader.exe install
+       （如果打开的是 PowerShell 窗口，第二行要写成 .\minio-uploader.exe install）
+   (3) 安装程序会先自动检查，看到下面内容表示通过：
+         [通过] 桶可访问（网络、密钥、时间均正常）
+         [通过] 上传并校验测试对象: your-bucket/photos/.uploader-check/电脑名.txt
+         [信息] 待上传照片 xxx 张，约 x.xx GB
+       检查不通过不会安装，按提示修改 config.json 后重新执行即可（常见原因见第九节）。
+   (4) 最后显示下面内容即安装完成：
+         上传任务 MinioPhotoUploader 状态: 正在运行
+         看门狗任务 MinioPhotoUploaderWatchdog 状态: 就绪
+
+   重要提醒：
+   - 安装完成后程序立即开始工作，目录里已有的照片会全部上传，
+     上传成功后本地照片会被删除，无法恢复。
+   - 检查时写入的测试文件 photos/.uploader-check/电脑名.txt
+     会留在 MinIO 上（每次检查覆盖同一个文件），可以忽略。
+   - 安装后 config.json 只有管理员能打开（里面有密钥）。
+     以后要修改，需要“以管理员身份运行”记事本再打开它。
+
+
+五、确认运行正常
+------------------------------------------------------------------
+1. 看日志：打开 data\logs\uploader-当天日期.log ，能看到类似：
+     2026-10-22 10:00:31 [INFO] 启动: D:\photos -> http://...，上传线程 4 个
+     2026-10-22 10:00:42 [INFO] 上传成功，已删除本地: photos/202610/20261022/a.jpg (840408 字节)
+     2026-10-22 10:00:42 [INFO] 本轮完成 4 张，失败 0 张，扫描到 4 张（4 线程）
+2. 看 MinIO 控制台：your-bucket / photos 下出现对应日期目录和照片。
+3. 测试自动重启（可选）：
+   任务管理器 → 详细信息 → 结束 minio-uploader.exe，
+   等 1～2 分钟，data\logs\restart-当天日期.log 里出现
+     [重启成功] 检测到上传程序未运行，已自动重启 ...
+4. 重启电脑后，不用登录，约 1 分钟内程序会自动运行。
+
+
+六、日常查看
+------------------------------------------------------------------
+1. 上传日志  data\logs\uploader-yyyyMMdd.log
+   [INFO]  正常信息（上传成功、启动、压缩日志等）
+   [WARN]  警告（单张照片失败、MinIO 暂时不可用而暂停等）
+   [ERROR] 错误（照片失败 5 次移到失败目录、程序异常等）
+
+   实时查看：双击程序目录下的 view-log.cmd（按 Ctrl+C 或关窗口退出，不影响后台程序）
+   或在 cmd 里执行：
+     powershell -NoProfile -Command "Get-Content ('D:\minio-uploader\data\logs\uploader-' + (Get-Date -Format yyyyMMdd) + '.log') -Encoding UTF8 -Tail 20 -Wait"
+   或在 PowerShell 窗口里执行：
+     Get-Content "D:\minio-uploader\data\logs\uploader-$(Get-Date -Format yyyyMMdd).log" -Encoding UTF8 -Tail 20 -Wait
+   只看警告和错误：
+     Get-Content "D:\minio-uploader\data\logs\uploader-$(Get-Date -Format yyyyMMdd).log" -Encoding UTF8 -Tail 20 -Wait | Select-String 'WARN|ERROR'
+   注意：过了零点会生成新的日志文件，需要按 Ctrl+C 后重新执行一次命令。
+
+2. 重启记录  data\logs\restart-yyyyMMdd.log
+   只有看门狗发现程序没在运行、把它重新拉起来时才会写。
+   没有这个文件，说明程序一直正常运行。
+
+3. 日志压缩
+   当天的日志是 .log 文本；前一天及更早的日志自动压缩成
+   logs-yyyyMMdd.zip（当天的上传日志和重启日志打在同一个包里），
+   压缩包保留 30 天，过期自动删除。
+
+4. 失败照片
+   位置：D:\photos_failed\（保持原来的目录结构）
+   记录：D:\photos_failed\failed-records.csv
+         列：时间、原路径、失败目录路径、文件大小、失败次数、最后错误
+   处理：查明原因后，把照片移回原来的目录，程序会重新上传
+         （失败次数从 0 开始重新计算）。
+
+5. 当天照片本地保留（KeepLocalDays = 1）
+   日志示例：
+     [INFO] 上传成功（本地保留，10-23 0 点后核对删除）: photos/202610/20261022/xxx.jpg (812345 字节)
+     [INFO] 本轮完成: 上传 2 张（其中本地保留 2 张），核对 MinIO 后删除本地 0 张，失败 0 张 ...
+   过了 0 点的第一轮会核对并删除前一天的照片（2 万多张约需几分钟，新照片优先上传），日志只记汇总：
+     [INFO] 本轮完成: 上传 3 张（其中本地保留 3 张），核对 MinIO 后删除本地 23516 张，失败 0 张 ...
+   核对时 MinIO 上没有或不一致的照片会重新上传，日志里会单独写明原因。
+   MinIO 连不上时不会删除任何本地照片，恢复后自动继续。
+
+6. 本地日期文件夹
+   默认不删除任何文件夹（CleanEmptyDirs = false），只删除已上传成功的照片，
+   照片传完后本地会留下空的日期文件夹，可以按需手动清理。
+   如果改成 true：文件夹变空、且创建超过 48 小时后，程序会自动删除这个空文件夹。
+   无论哪种设置，MinIO 上的文件夹和照片都不受影响。
+
+
+七、常用操作（在“管理员”命令提示符 cmd 里执行）
+------------------------------------------------------------------
+先进入程序目录：
+  cd /d D:\minio-uploader
+（在 PowerShell 窗口里，下面的 minio-uploader.exe 要写成 .\minio-uploader.exe）
+
+查看任务状态：
+  schtasks /Query /TN MinioPhotoUploader
+  schtasks /Query /TN MinioPhotoUploaderWatchdog
+  （上传任务显示“正在运行”为正常；看门狗平时显示“就绪”是正常的）
+
+修改 config.json 后让配置生效（重启上传程序）：
+  schtasks /End /TN MinioPhotoUploader
+  schtasks /Run /TN MinioPhotoUploader
+
+临时停止（例如维护期间，看门狗不会把它拉起来）：
+  schtasks /Change /TN MinioPhotoUploader /DISABLE
+  schtasks /End    /TN MinioPhotoUploader
+
+恢复运行：
+  schtasks /Change /TN MinioPhotoUploader /ENABLE
+  schtasks /Run    /TN MinioPhotoUploader
+
+只做检查，不上传、不删照片：
+  minio-uploader.exe check
+
+手动执行一轮上传后退出（会真实上传并删除照片）：
+  minio-uploader.exe once
+  注意：后台程序正在运行时，手动运行会提示“已有一个上传程序在运行”并退出，
+        需要先按上面“临时停止”的方法停掉后台程序。
+
+使用另一份配置文件（例如先拿测试目录试）：
+  minio-uploader.exe once --config D:\minio-uploader\config.test.json
+
+卸载（删除两个计划任务并结束程序，不会删除照片、日志和配置）：
+  minio-uploader.exe uninstall
+
+查看帮助：
+  minio-uploader.exe help
+
+
+八、config.json 参数说明
+------------------------------------------------------------------
+必须修改：
+  Endpoint        MinIO API 地址，必须是 9000 端口，例如 http://your-minio-host:9000
+  AccessKey       上传账号用户名
+  SecretKey       上传账号密码
+
+按实际情况确认：
+  Bucket          桶名，默认 your-bucket
+  ObjectPrefix    桶里的目录前缀，默认 photos；留空则直接放在桶根目录
+  SourceDir       本地照片目录，默认 D:\\photos
+  FailedDir       失败照片目录，默认 D:\\photos_failed（不能放在 SourceDir 里面）
+  Extensions      上传的文件类型，默认 [".jpg", ".jpeg", ".bmp"]（不区分大小写）
+
+一般不用改：
+  Region                 区域，MinIO 默认 us-east-1
+  DataDir                日志和记录目录，默认 data（在程序文件夹里）
+  UploadThreads          同时上传的数量，默认 4（1～32）。补传大量积压照片时可调到 8
+  ScanIntervalSeconds    扫描间隔，默认 10 秒
+  StableSeconds          照片最后修改超过多少秒才上传，默认 30 秒
+  MaxFailures            单张照片最多失败次数，默认 5 次
+  RetryDelaySeconds      单张照片失败后隔多少秒再试，默认 60 秒
+  RequestTimeoutSeconds  单次上传超时，默认 120 秒
+  KeepLocalDays          上传成功后本地保留几天，按照片的修改日期、每天 0 点切换：
+                           0 = 上传成功立即删除本地
+                           1 = 保留当天的照片，0 点后核对 MinIO 再删除（部署默认）
+                           2 = 保留今天和昨天的照片，以此类推
+                         注意：本地会多占用保留天数的照片空间（约每天 10GB）
+  CleanEmptyDirs         照片传完后是否删除空的旧目录，默认 false（不删除任何文件夹）
+  EmptyDirMinAgeHours    CleanEmptyDirs 为 true 时，目录创建超过多少小时才允许删除，默认 48
+  LogRetentionDays       压缩日志保留天数，默认 30；0 表示永久保留
+
+以 _ 开头的项（如 "_说明"）只是备注，程序不读取。
+
+
+九、常见问题
+------------------------------------------------------------------
+Q1：提示“请用以管理员身份运行打开命令行窗口”
+    install / uninstall 需要管理员权限，按第四节第 3 步重新打开窗口。
+
+Q2：PowerShell 里提示“无法将 minio-uploader.exe 项识别为 cmdlet”
+    PowerShell 里运行当前目录的程序要加 .\ ，写成 .\minio-uploader.exe install
+
+Q3：检查提示 [失败] 桶不可访问，根据后面的错误判断：
+    网络错误 / 无法连接            地址或端口不对（要用 9000），或网络、防火墙不通
+    HTTP 403 InvalidAccessKeyId     AccessKey 填错
+    HTTP 403 SignatureDoesNotMatch  SecretKey 填错
+    HTTP 403 RequestTimeTooSkewed   本机时间和 MinIO 服务器相差超过 15 分钟，校准系统时间
+    HTTP 404 NoSuchBucket           桶名填错
+    HTTP 403 AccessDenied           账号没有这个桶的权限，检查第三节的策略
+
+Q4：检查提示 [失败] 上传测试对象: HTTP 403 AccessDenied
+    账号有桶的权限，但没有这个目录的上传权限。
+    检查 minio-policy.json 里的目录是否和 config.json 的 ObjectPrefix 一致。
+
+Q5：提示“配置文件不是有效的 JSON”
+    config.json 格式写坏了：常见是路径反斜杠只写了一个、少了逗号或双引号。
+
+Q6：照片一直没上传
+    - 照片格式是否在 Extensions 里（例如 png 默认不传）
+    - 照片是否在 SourceDir 目录下
+    - 新照片要等 30 秒（StableSeconds）后才会上传
+    - 查看当天 uploader 日志，是否有“暂停上传”，后面会写明原因
+
+Q7：日志里出现“MinIO 不可用或拒绝访问，暂停上传”
+    网络断了、MinIO 停了或密钥失效。程序会自动重试，恢复后自动继续，
+    照片不会丢失，也不计失败次数。长时间不恢复时，用 check 检查原因。
+
+Q8：minio-uploader.exe 被杀毒软件 / 电脑管家拦截或删除
+    这是自己编译的程序，没有数字签名，可能被误报。
+    在软件里把 D:\minio-uploader 加入信任区，再从备份拷回 exe。
+
+Q8-2：安装时报“程序异常: 未能找到文件 D:\minio-uploader\data”，
+      或 Windows 安全中心弹出“Protected folder access blocked / 已阻止受保护文件夹访问”
+    这台电脑开启了 Windows Defender 的“受控文件夹访问”（勒索软件防护），
+    没有被允许的程序不能在受保护的磁盘或文件夹里新建文件夹、写文件。
+    处理：只放行本程序（不要关闭整个防护，也不要放行 powershell.exe）
+      Windows 安全中心 → 病毒和威胁防护 → 勒索软件防护 → 管理勒索软件防护
+      → 允许应用通过受控文件夹访问 → 添加允许的应用 → 浏览所有应用
+      → 选择 D:\minio-uploader\minio-uploader.exe
+    或在管理员 PowerShell 里执行：
+      Add-MpPreference -ControlledFolderAccessAllowedApplications "D:\minio-uploader\minio-uploader.exe"
+    放行后重新执行 install。注意：放行是按路径记录的，exe 换位置后要重新放行。
+    建议在新电脑上安装前先做这一步。
+
+Q9：拷贝到新电脑要注意什么？
+    - 只拷贝第二节的 4 个文件，不要带 data 文件夹
+    - 按第四节修改 config.json 并执行 install
+    - 多台电脑可以共用同一个 MinIO 上传账号；
+      如果多台电脑的照片文件名可能重复，请给每台电脑设置不同的
+      ObjectPrefix（例如 photos/line1），并同步修改 MinIO 策略，
+      否则同名照片会互相覆盖。
+
+Q10：需要修改程序怎么办？
+    改 src\Program.cs 后双击 src\build.cmd，会在上一级目录重新生成 minio-uploader.exe。
+    （使用 Windows 自带的 .NET 编译器，不需要安装 Visual Studio）
